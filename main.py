@@ -3,10 +3,14 @@ from fastapi import FastAPI, Request
 
 app = FastAPI()
 
+# ============================================================
+# Q1 — Release Gate
+# ============================================================
+
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
-def evaluate(body: dict) -> dict:
+def evaluate_release_gate(body: dict) -> dict:
     v = set()
     wf = body.get("workflow") or {}
     img = body.get("image") or {}
@@ -65,9 +69,115 @@ def evaluate(body: dict) -> dict:
 @app.post("/release-gate")
 async def release_gate(request: Request):
     body = await request.json()
-    return evaluate(body)
+    return evaluate_release_gate(body)
 
+
+# ============================================================
+# Q2 — LLM Action Firewall
+# ============================================================
+
+TENANT = "tenant-zwyfpd4"
+EMAIL_DOMAIN = "notify-aq3oq1n.example"
+ALLOWED_TOOLS = {"search", "lookup_record", "send_email", "render_html"}
+
+
+def _r(decision, reason):
+    return {"decision": decision, "reason": reason}
+
+
+def _is_str(x):
+    return isinstance(x, str)
+
+
+def _html_safe(html: str) -> bool:
+    h = html.lower()
+    if "<script" in h:
+        return False
+    if "<iframe" in h:
+        return False
+    if "javascript:" in h:
+        return False
+    if re.search(r"\bon\w+\s*=", h):  # inline event handlers
+        return False
+    return True
+
+
+def evaluate_firewall(body: dict) -> dict:
+    # 1. Top-level schema
+    if not isinstance(body, dict):
+        return _r("block", "INVALID_SCHEMA")
+    if body.get("provenance") not in ("trusted", "untrusted"):
+        return _r("block", "INVALID_SCHEMA")
+    if not isinstance(body.get("humanApproved"), bool):
+        return _r("block", "INVALID_SCHEMA")
+
+    action = body.get("action")
+    if not isinstance(action, dict):
+        return _r("block", "INVALID_SCHEMA")
+    tool = action.get("tool")
+    args = action.get("args")
+    if not _is_str(tool) or not isinstance(args, dict):
+        return _r("block", "INVALID_SCHEMA")
+
+    # 2. Tool allowlist
+    if tool not in ALLOWED_TOOLS:
+        return _r("block", "TOOL_NOT_ALLOWED")
+
+    # 3-7. Per-tool schema, then tenant/egress/approval/safety
+    if tool == "search":
+        if set(args.keys()) != {"query"}:
+            return _r("block", "INVALID_SCHEMA")
+        q = args.get("query")
+        if not _is_str(q) or not (1 <= len(q) <= 200):
+            return _r("block", "INVALID_SCHEMA")
+        return _r("allow", "ALLOW")
+
+    if tool == "lookup_record":
+        if set(args.keys()) != {"tenantId", "recordId"}:
+            return _r("block", "INVALID_SCHEMA")
+        tid, rid = args.get("tenantId"), args.get("recordId")
+        if not _is_str(tid) or not _is_str(rid) or len(rid) == 0:
+            return _r("block", "INVALID_SCHEMA")
+        if tid != TENANT:
+            return _r("block", "TENANT_SCOPE")
+        return _r("allow", "ALLOW")
+
+    if tool == "send_email":
+        if set(args.keys()) != {"to", "subject", "body"}:
+            return _r("block", "INVALID_SCHEMA")
+        to, subj, bod = args.get("to"), args.get("subject"), args.get("body")
+        if not (_is_str(to) and _is_str(subj) and _is_str(bod)):
+            return _r("block", "INVALID_SCHEMA")
+        domain = to.rsplit("@", 1)[1] if "@" in to else ""
+        if domain != EMAIL_DOMAIN:
+            return _r("block", "EGRESS_DENIED")
+        if body.get("humanApproved") is not True:
+            return _r("block", "APPROVAL_REQUIRED")
+        return _r("allow", "ALLOW")
+
+    if tool == "render_html":
+        if set(args.keys()) != {"html"}:
+            return _r("block", "INVALID_SCHEMA")
+        html = args.get("html")
+        if not _is_str(html):
+            return _r("block", "INVALID_SCHEMA")
+        if not _html_safe(html):
+            return _r("block", "UNSAFE_OUTPUT")
+        return _r("allow", "ALLOW")
+
+    return _r("block", "TOOL_NOT_ALLOWED")
+
+
+@app.post("/action-firewall")
+async def action_firewall(request: Request):
+    body = await request.json()
+    return evaluate_firewall(body)
+
+
+# ============================================================
+# Health
+# ============================================================
 
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {"status": "ok", "endpoints": ["/release-gate", "/action-firewall"]}

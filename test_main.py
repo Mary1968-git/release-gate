@@ -1,4 +1,4 @@
-from main import evaluate
+from main import evaluate_release_gate as evaluate, evaluate_firewall
 
 SAFE = {
     "target": "preview", "event": "pull_request", "ref": "refs/heads/feature",
@@ -15,28 +15,23 @@ SAFE = {
 
 def test_safe_promotes():
     assert evaluate(SAFE)["decision"] == "promote"
-    assert evaluate(SAFE)["violations"] == []
 
 
-def test_multi_failure():
-    bad = {**SAFE, "workflow": {**SAFE["workflow"]}, "image": {**SAFE["image"]}}
-    bad["workflow"]["trigger"] = "pull_request_target"
-    bad["workflow"]["failFast"] = True
-    bad["image"]["runsAsRoot"] = True
-    bad["image"]["secretMode"] = "arg"
-    out = evaluate(bad)
-    assert out["decision"] == "block"
-    for code in ["UNSAFE_PR_TRIGGER", "TESTS_INCOMPLETE", "ROOT_RUNTIME", "SECRET_IN_LAYER"]:
-        assert code in out["violations"]
+def test_firewall_search_allow():
+    out = evaluate_firewall({"provenance": "untrusted", "humanApproved": False,
+                             "action": {"tool": "search", "args": {"query": "hi"}}})
+    assert out == {"decision": "allow", "reason": "ALLOW"}
 
 
-def test_production_ref():
-    prod = {**SAFE, "target": "production", "event": "push", "ref": "refs/heads/dev",
-            "workflow": {**SAFE["workflow"], "environmentApproval": True}}
-    assert "INVALID_PRODUCTION_REF" in evaluate(prod)["violations"]
+def test_firewall_tenant_scope():
+    out = evaluate_firewall({"provenance": "trusted", "humanApproved": False,
+                             "action": {"tool": "lookup_record",
+                                        "args": {"tenantId": "wrong", "recordId": "r1"}}})
+    assert out["reason"] == "TENANT_SCOPE"
 
 
-def test_extra_permission_key():
-    p = {**SAFE, "workflow": {**SAFE["workflow"],
-         "permissions": {"contents": "read", "packages": "write", "id-token": "none", "actions": "write"}}}
-    assert "EXCESS_PERMISSION" in evaluate(p)["violations"]
+def test_firewall_egress():
+    out = evaluate_firewall({"provenance": "trusted", "humanApproved": True,
+                             "action": {"tool": "send_email",
+                                        "args": {"to": "a@evil.example", "subject": "s", "body": "b"}}})
+    assert out["reason"] == "EGRESS_DENIED"

@@ -348,37 +348,40 @@ def _extract_urls(channel: str, output: str):
 
 
 def _has_dangerous_scheme(text: str, urls) -> bool:
-    # literal dangerous schemes anywhere (optional whitespace before colon)
+    # 1. A dangerous scheme appearing as an actual URI scheme at the START of any extracted URL
+    for u in urls:
+        u2 = u.strip()
+        m = re.match(r"^\s*([a-zA-Z][a-zA-Z0-9+.\-]*)\s*:", u2)
+        if m:
+            sch = m.group(1).lower()
+            if sch in ("javascript", "data", "vbscript"):
+                return True
+            if sch not in ("http", "https"):
+                # protocol-relative handled separately (no scheme match)
+                return True
+    # 2. Literal dangerous scheme token anywhere in the raw text (spec: "the text contains ...")
     if re.search(r"(?i)(javascript|data|vbscript)\s*:", text):
         return True
-    # extracted URL using scheme other than http/https
-    for u in urls:
-        u = u.strip()
-        if not u:
-            continue
-        # protocol-relative -> https
-        if u.startswith("//"):
-            continue  # scheme is effectively https, fine here
-        scheme_m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]*):", u)
-        if scheme_m:
-            sch = scheme_m.group(1).lower()
-            if sch not in ("http", "https"):
-                return True
     return False
 
 
 def _get_hostname(u: str):
-    """Parse absolute/protocol-relative URL, return hostname or None if relative."""
     u = u.strip()
     if not u:
         return None
     if u.startswith("//"):
         u = "https:" + u
-    parsed = urlsplit(u)
+    try:
+        parsed = urlsplit(u)
+    except Exception:
+        return ""  # unparseable absolute-looking -> treat as exfil-risk
     if not parsed.scheme:
-        # relative reference like /local/page
-        return None
-    return (parsed.hostname or "").lower()
+        return None  # relative
+    host = (parsed.hostname or "").lower()
+    # strip a trailing dot (FQDN form) so "cdn-z3gbllt.example." matches
+    if host.endswith("."):
+        host = host[:-1]
+    return host
 
 
 def _has_external_exfil(urls) -> bool:

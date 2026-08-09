@@ -20,3 +20,5 @@ jobs:
       - run: pip install -r requirements.txt
 
       - run: pytest
+      - run: pip install -r requirements.txt pytest
+      - run: pytest

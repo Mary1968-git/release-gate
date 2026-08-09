@@ -282,11 +282,199 @@ def evaluate_terraform(body: dict) -> dict:
 async def terraform_plan(request: Request):
     body = await request.json()
     return evaluate_terraform(body)
+# ============================================================
+# Q4 — LLM Output Sanitizer
+# ============================================================
 
+import html as _html_mod
+from urllib.parse import urlparse, urlsplit
+
+ALLOWED_HOSTS = {"cdn-z3gbllt.example", "app-qafa1yn.example"}
+VALID_CHANNELS = {"html", "markdown", "url", "sql", "shell"}
+
+
+def _san(safe, reason):
+    return {"safe": safe, "reason": reason}
+
+
+def _decode_once(s: str) -> str:
+    """Decode percent-escapes, then HTML entities, then \\uXXXX escapes."""
+    out = s
+    # 1. percent-escapes
+    try:
+        from urllib.parse import unquote
+        out = unquote(out)
+    except Exception:
+        pass
+    # 2. HTML entities (numeric + the named set)
+    out = _html_mod.unescape(out)
+    # 3. \uXXXX escapes
+    def repl_u(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except Exception:
+            return m.group(0)
+    out = re.sub(r"\\u([0-9a-fA-F]{4})", repl_u, out)
+    return out
+
+
+def _extract_urls(channel: str, output: str):
+    """Return list of candidate URL strings for the channel."""
+    urls = []
+    if channel == "html":
+        # quoted src= and href= values
+        for m in re.finditer(r'(?:src|href)\s*=\s*"([^"]*)"', output, re.IGNORECASE):
+            urls.append(m.group(1))
+        for m in re.finditer(r"(?:src|href)\s*=\s*'([^']*)'", output, re.IGNORECASE):
+            urls.append(m.group(1))
+    elif channel == "markdown":
+        # target inside ](...)
+        for m in re.finditer(r"\]\(([^)]*)\)", output):
+            urls.append(m.group(1).strip())
+    elif channel == "url":
+        urls.append(output.strip())
+    return urls
+
+
+def _has_dangerous_scheme(text: str, urls) -> bool:
+    # literal dangerous schemes anywhere (optional whitespace before colon)
+    if re.search(r"(?i)(javascript|data|vbscript)\s*:", text):
+        return True
+    # extracted URL using scheme other than http/https
+    for u in urls:
+        u = u.strip()
+        if not u:
+            continue
+        # protocol-relative -> https
+        if u.startswith("//"):
+            continue  # scheme is effectively https, fine here
+        scheme_m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]*):", u)
+        if scheme_m:
+            sch = scheme_m.group(1).lower()
+            if sch not in ("http", "https"):
+                return True
+    return False
+
+
+def _get_hostname(u: str):
+    """Parse absolute/protocol-relative URL, return hostname or None if relative."""
+    u = u.strip()
+    if not u:
+        return None
+    if u.startswith("//"):
+        u = "https:" + u
+    parsed = urlsplit(u)
+    if not parsed.scheme:
+        # relative reference like /local/page
+        return None
+    return (parsed.hostname or "").lower()
+
+
+def _has_external_exfil(urls) -> bool:
+    for u in urls:
+        host = _get_hostname(u)
+        if host is None:
+            continue  # relative, fine
+        if host == "":
+            return True
+        if host not in ALLOWED_HOSTS:
+            return True
+    return False
+
+
+def _has_sql_metachar(text: str) -> bool:
+    if "'" in text or '"' in text or ";" in text:
+        return True
+    if "--" in text or "/*" in text:
+        return True
+    if re.search(r"(?i)\bunion\b", text):
+        return True
+    if re.search(r"(?i)\bor\s+1\s*=\s*1", text):
+        return True
+    return False
+
+
+def _has_shell_metachar(text: str) -> bool:
+    for ch in (";", "&", "|", "`", "<", ">"):
+        if ch in text:
+            return True
+    if "$(" in text or "${" in text:
+        return True
+    return False
+
+
+def _apply_channel_rules(channel: str, output: str):
+    """Return reason string if a rule trips, else None."""
+    urls = _extract_urls(channel, output)
+
+    if channel == "html":
+        # SCRIPT_TAG: opening script/iframe/object/embed
+        if re.search(r"(?i)<\s*(script|iframe|object|embed)\b", output):
+            return "SCRIPT_TAG"
+        # EVENT_HANDLER: on...= attribute
+        if re.search(r"(?i)\bon\w+\s*=", output):
+            return "EVENT_HANDLER"
+        if _has_dangerous_scheme(output, urls):
+            return "DANGEROUS_SCHEME"
+        if _has_external_exfil(urls):
+            return "EXTERNAL_EXFIL"
+        return None
+
+    if channel in ("markdown", "url"):
+        if _has_dangerous_scheme(output, urls):
+            return "DANGEROUS_SCHEME"
+        if _has_external_exfil(urls):
+            return "EXTERNAL_EXFIL"
+        return None
+
+    if channel == "sql":
+        if _has_sql_metachar(output):
+            return "SQL_METACHAR"
+        return None
+
+    if channel == "shell":
+        if _has_shell_metachar(output):
+            return "SHELL_METACHAR"
+        return None
+
+    return None
+
+
+def evaluate_sanitize(body: dict) -> dict:
+    # ---- INVALID_SCHEMA ----
+    if not isinstance(body, dict):
+        return _san(False, "INVALID_SCHEMA")
+    channel = body.get("channel")
+    output = body.get("output")
+    if channel not in VALID_CHANNELS:
+        return _san(False, "INVALID_SCHEMA")
+    if not isinstance(output, str):
+        return _san(False, "INVALID_SCHEMA")
+    if len(output) > 20000:
+        return _san(False, "INVALID_SCHEMA")
+
+    # ---- ENCODED_PAYLOAD ----
+    decoded = _decode_once(output)
+    if decoded != output:
+        if _apply_channel_rules(channel, decoded) is not None:
+            return _san(False, "ENCODED_PAYLOAD")
+
+    # ---- channel rules on original ----
+    reason = _apply_channel_rules(channel, output)
+    if reason is not None:
+        return _san(False, reason)
+
+    return _san(True, "SAFE")
+
+
+@app.post("/sanitize-output")
+async def sanitize_output(request: Request):
+    body = await request.json()
+    return evaluate_sanitize(body)
 # ============================================================
 # Health
 # ============================================================
 
 @app.get("/")
 def root():
-    return {"status": "ok", "endpoints": ["/release-gate", "/action-firewall", "/terraform/plan"]}
+    return {"status": "ok", "endpoints": ["/release-gate", "/action-firewall", "/terraform/plan", "/sanitize-output"]}

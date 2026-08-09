@@ -486,9 +486,131 @@ async def sanitize_output(request: Request):
         return _san(False, "INVALID_SCHEMA")
     return evaluate_sanitize(body)
 # ============================================================
+# Q5 — OSINT Corroboration Engine
+# ============================================================
+
+from datetime import datetime, timezone
+
+VALID_SOURCE_TYPES = {"dns", "ct_log", "registry", "archive", "scan"}
+
+
+def _cor(verdict, confidence, sources):
+    return {"verdict": verdict, "confidence": confidence, "corroboratingSources": sources}
+
+
+def _parse_iso(s):
+    """Parse ISO8601, return datetime or None."""
+    if not isinstance(s, str):
+        return None
+    try:
+        # handle trailing Z
+        t = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _valid_source(src):
+    if not isinstance(src, dict):
+        return False
+    if not isinstance(src.get("id"), str):
+        return False
+    if not isinstance(src.get("origin"), str):
+        return False
+    if not isinstance(src.get("value"), str):
+        return False
+    if not isinstance(src.get("observedAt"), str):
+        return False
+    if src.get("type") not in VALID_SOURCE_TYPES:
+        return False
+    return True
+
+
+def evaluate_corroborate(body: dict) -> dict:
+    # ---- 1. invalid ----
+    if not isinstance(body, dict):
+        return _cor("invalid", "low", [])
+    claim = body.get("claim")
+    if not isinstance(claim, dict) or not isinstance(claim.get("value"), str):
+        return _cor("invalid", "low", [])
+    as_of = _parse_iso(body.get("asOf"))
+    if as_of is None:
+        return _cor("invalid", "low", [])
+    staleness = body.get("stalenessDays")
+    if not isinstance(staleness, (int, float)) or isinstance(staleness, bool):
+        return _cor("invalid", "low", [])
+    sources = body.get("sources")
+    if not isinstance(sources, list):
+        return _cor("invalid", "low", [])
+
+    claim_value = claim["value"]
+
+    # keep only valid sources
+    valid = [s for s in sources if _valid_source(s)]
+
+    # compute freshness
+    def is_fresh(src):
+        obs = _parse_iso(src["observedAt"])
+        if obs is None:
+            return False
+        delta_days = (as_of - obs).total_seconds() / 86400.0
+        return 0 <= delta_days <= staleness or delta_days <= staleness
+        # note: asOf - observedAt <= stalenessDays; negative (future) also <= staleness
+
+    # Actually: Fresh means asOf - observedAt <= stalenessDays (and not stale).
+    def fresh(src):
+        obs = _parse_iso(src["observedAt"])
+        if obs is None:
+            return False
+        delta_days = (as_of - obs).total_seconds() / 86400.0
+        return delta_days <= staleness
+
+    fresh_sources = [s for s in valid if fresh(s)]
+
+    # ---- 2. contradicted ----
+    contradicting = [
+        s for s in fresh_sources
+        if s.get("authoritative") is True and s["value"] != claim_value
+    ]
+    if contradicting:
+        ids = sorted(s["id"] for s in contradicting)
+        return _cor("contradicted", "low", ids)
+
+    # ---- 3. supported ----
+    # fresh sources whose value == claim
+    agreeing = [s for s in fresh_sources if s["value"] == claim_value]
+    # reduce to one representative per origin (lexicographically smallest id)
+    reps_by_origin = {}
+    for s in agreeing:
+        o = s["origin"]
+        if o not in reps_by_origin or s["id"] < reps_by_origin[o]["id"]:
+            reps_by_origin[o] = s
+    reps = list(reps_by_origin.values())
+
+    if len(reps) >= 2:
+        types = {s["type"] for s in reps}
+        confidence = "high" if len(types) >= 2 else "medium"
+        ids = sorted(s["id"] for s in reps)
+        return _cor("supported", confidence, ids)
+
+    # ---- 4. unverified ----
+    return _cor("unverified", "low", [])
+
+
+@app.post("/corroborate")
+async def corroborate(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _cor("invalid", "low", [])
+    return evaluate_corroborate(body)
+# ============================================================
 # Health
 # ============================================================
 
 @app.get("/")
 def root():
-    return {"status": "ok", "endpoints": ["/release-gate", "/action-firewall", "/terraform/plan", "/sanitize-output"]}
+    return {"status": "ok", "endpoints": ["/release-gate", "/action-firewall", "/terraform/plan", "/sanitize-output", "/corroborate"]}

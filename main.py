@@ -68,8 +68,12 @@ def evaluate_release_gate(body: dict) -> dict:
 
 @app.post("/release-gate")
 async def release_gate(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
     return evaluate_release_gate(body)
+
 
 
 # ============================================================
@@ -170,7 +174,10 @@ def evaluate_firewall(body: dict) -> dict:
 
 @app.post("/action-firewall")
 async def action_firewall(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return _r("block", "INVALID_SCHEMA")
     return evaluate_firewall(body)
 # ============================================================
 # Q3 — Terraform Plan Policy Gate
@@ -280,8 +287,12 @@ def evaluate_terraform(body: dict) -> dict:
 
 @app.post("/terraform/plan")
 async def terraform_plan(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return _tf("reject", "INVALID_PLAN")
     return evaluate_terraform(body)
+
 # ============================================================
 # Q4 — LLM Output Sanitizer
 # ============================================================
@@ -469,7 +480,10 @@ def evaluate_sanitize(body: dict) -> dict:
 
 @app.post("/sanitize-output")
 async def sanitize_output(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return _san(False, "INVALID_SCHEMA")
     return evaluate_sanitize(body)
 # ============================================================
 # Health

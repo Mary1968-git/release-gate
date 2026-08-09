@@ -172,7 +172,116 @@ def evaluate_firewall(body: dict) -> dict:
 async def action_firewall(request: Request):
     body = await request.json()
     return evaluate_firewall(body)
+# ============================================================
+# Q3 — Terraform Plan Policy Gate
+# ============================================================
 
+TF_WORKSPACE = "prod-p3n39e"
+TF_LABELS = {"owner": "student-qle1f", "environment": "production", "cost_center": "cc-4oaq"}
+VALID_BACKENDS = {"gcs", "s3", "azurerm", "remote"}
+PROTECTED_DELETE_TYPES = {"storage_bucket", "sql_database", "persistent_disk"}
+
+
+def _tf(decision, reason):
+    return {"decision": decision, "reason": reason}
+
+
+def _provider_pinned(pv: str) -> bool:
+    """True if exact or pessimistically pinned; False if unpinned."""
+    s = pv.strip()
+    # Unpinned markers
+    if ">=" in s or "*" in s or "latest" in s.lower():
+        return False
+    # Pessimistic pin
+    if s.startswith("~>"):
+        return True
+    # Exact: "6.2.1" or "= 6.2.1"
+    body = s[1:].strip() if s.startswith("=") else s
+    if re.fullmatch(r"\d+\.\d+\.\d+", body):
+        return True
+    return False
+
+
+def evaluate_terraform(body: dict) -> dict:
+    # ---- 1. Type validation ----
+    if not isinstance(body, dict):
+        return _tf("reject", "INVALID_PLAN")
+
+    env = body.get("environment")
+    state = body.get("state")
+    pv = body.get("providerVersion")
+    destroy_approved = body.get("destroyApproved")
+    resource = body.get("resource")
+
+    if not isinstance(env, str):
+        return _tf("reject", "INVALID_PLAN")
+    if not isinstance(state, dict):
+        return _tf("reject", "INVALID_PLAN")
+    if not isinstance(state.get("backend"), str) or not isinstance(state.get("locked"), bool):
+        return _tf("reject", "INVALID_PLAN")
+    if not isinstance(pv, str):
+        return _tf("reject", "INVALID_PLAN")
+    if not isinstance(destroy_approved, bool):
+        return _tf("reject", "INVALID_PLAN")
+    if not isinstance(resource, dict):
+        return _tf("reject", "INVALID_PLAN")
+
+    r_type = resource.get("type")
+    r_action = resource.get("action")
+    r_labels = resource.get("labels")
+    r_secret = resource.get("secret")
+    r_force = resource.get("forceDestroy")
+
+    if not isinstance(r_type, str):
+        return _tf("reject", "INVALID_PLAN")
+    if r_action not in ("create", "update", "delete"):
+        return _tf("reject", "INVALID_PLAN")
+    if not isinstance(r_labels, dict):
+        return _tf("reject", "INVALID_PLAN")
+    # secret must be null or string
+    if r_secret is not None and not isinstance(r_secret, str):
+        return _tf("reject", "INVALID_PLAN")
+    if not isinstance(r_force, bool):
+        return _tf("reject", "INVALID_PLAN")
+
+    # ---- 2. Environment exact match ----
+    if env != TF_WORKSPACE:
+        return _tf("reject", "ENVIRONMENT_MISMATCH")
+
+    # ---- 3. State backend + locked ----
+    if state.get("backend") not in VALID_BACKENDS or state.get("locked") is not True:
+        return _tf("reject", "STATE_UNSAFE")
+
+    # ---- 4. Provider pinning ----
+    if not _provider_pinned(pv):
+        return _tf("reject", "UNPINNED_PROVIDER")
+
+    # ---- 5. Labels exact ----
+    for k, val in TF_LABELS.items():
+        if r_labels.get(k) != val:
+            return _tf("reject", "MISSING_LABELS")
+
+    # ---- 6. Secret ----
+    if r_secret is not None:
+        if not (isinstance(r_secret, str) and r_secret.startswith("secret://") and len(r_secret) > len("secret://")):
+            return _tf("reject", "PLAINTEXT_SECRET")
+
+    # ---- 7. Protected delete needs approval ----
+    if r_action == "delete" and r_type in PROTECTED_DELETE_TYPES:
+        if destroy_approved is not True:
+            return _tf("reject", "DELETE_NOT_APPROVED")
+
+    # ---- 8. Prod storage_bucket forceDestroy ----
+    if r_type == "storage_bucket" and r_force is True:
+        return _tf("reject", "FORCE_DESTROY")
+
+    return _tf("approve", "APPROVE")
+
+
+@app.post("/terraform/plan")
+async def terraform_plan(request: Request):
+    body = await request.json()
+    return evaluate_terraform(body)
 
 # ============================================================
 # Health
@@ -180,4 +289,4 @@ async def action_firewall(request: Request):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "endpoints": ["/release-gate", "/action-firewall"]}
+    return {"status": "ok", "endpoints": ["/release-gate", "/action-firewall", "/terraform/plan"]}
